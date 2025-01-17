@@ -7,6 +7,7 @@ import {
   CreatePaymentMethodDTO,
   CreatePaymentSessionDTO,
   CreateRefundDTO,
+  AccountHolderDTO,
   DAL,
   FilterablePaymentCollectionProps,
   FilterablePaymentMethodProps,
@@ -31,6 +32,7 @@ import {
   UpdatePaymentCollectionDTO,
   UpdatePaymentDTO,
   UpdatePaymentSessionDTO,
+  CreateAccountHolderDTO,
   UpsertPaymentCollectionDTO,
   WebhookActionResult,
 } from "@medusajs/framework/types"
@@ -38,6 +40,7 @@ import {
   BigNumber,
   InjectManager,
   InjectTransactionManager,
+  isPresent,
   isString,
   MathBN,
   MedusaContext,
@@ -48,6 +51,7 @@ import {
   promiseAll,
 } from "@medusajs/framework/utils"
 import {
+  AccountHolder,
   Capture,
   Payment,
   PaymentCollection,
@@ -66,6 +70,7 @@ type InjectedDependencies = {
   refundService: ModulesSdkTypes.IMedusaInternalService<any>
   paymentSessionService: ModulesSdkTypes.IMedusaInternalService<any>
   paymentCollectionService: ModulesSdkTypes.IMedusaInternalService<any>
+  accountHolderService: ModulesSdkTypes.IMedusaInternalService<any>
   paymentProviderService: PaymentProviderService
 }
 
@@ -76,6 +81,7 @@ const generateMethodForModels = {
   Capture,
   Refund,
   RefundReason,
+  AccountHolder,
 }
 
 export default class PaymentModuleService
@@ -86,6 +92,7 @@ export default class PaymentModuleService
     Capture: { dto: CaptureDTO }
     Refund: { dto: RefundDTO }
     RefundReason: { dto: RefundReasonDTO }
+    AccountHolder: { dto: AccountHolderDTO }
   }>(generateMethodForModels)
   implements IPaymentModuleService
 {
@@ -107,6 +114,9 @@ export default class PaymentModuleService
     typeof PaymentCollection
   >
   protected paymentProviderService_: PaymentProviderService
+  protected accountHolderService_: ModulesSdkTypes.IMedusaInternalService<
+    typeof AccountHolder
+  >
 
   constructor(
     {
@@ -117,6 +127,7 @@ export default class PaymentModuleService
       paymentSessionService,
       paymentProviderService,
       paymentCollectionService,
+      accountHolderService,
     }: InjectedDependencies,
     protected readonly moduleDeclaration: InternalModuleDeclaration
   ) {
@@ -131,6 +142,7 @@ export default class PaymentModuleService
     this.paymentSessionService_ = paymentSessionService
     this.paymentProviderService_ = paymentProviderService
     this.paymentCollectionService_ = paymentCollectionService
+    this.accountHolderService_ = accountHolderService
   }
 
   __joinerConfig(): ModuleJoinerConfig {
@@ -328,7 +340,8 @@ export default class PaymentModuleService
       providerPaymentSession = await this.paymentProviderService_.createSession(
         input.provider_id,
         {
-          context: { ...input.context, session_id: paymentSession!.id },
+          context: input.context,
+          data: { ...input.data, medusa_session_id: paymentSession!.id },
           amount: input.amount,
           currency_code: input.currency_code,
         }
@@ -345,8 +358,7 @@ export default class PaymentModuleService
       )[0]
     } catch (error) {
       if (providerPaymentSession) {
-        await this.paymentProviderService_.deleteSession({
-          provider_id: input.provider_id,
+        await this.paymentProviderService_.deleteSession(input.provider_id, {
           data: input.data,
         })
       }
@@ -420,8 +432,7 @@ export default class PaymentModuleService
       sharedContext
     )
 
-    await this.paymentProviderService_.deleteSession({
-      provider_id: session.provider_id,
+    await this.paymentProviderService_.deleteSession(session.provider_id, {
       data: session.data,
     })
 
@@ -460,11 +471,11 @@ export default class PaymentModuleService
     }
 
     let { data, status } = await this.paymentProviderService_.authorizePayment(
+      session.provider_id,
       {
-        provider_id: session.provider_id,
         data: session.data,
-      },
-      context
+        context,
+      }
     )
 
     if (
@@ -486,8 +497,7 @@ export default class PaymentModuleService
         sharedContext
       )
     } catch (error) {
-      await this.paymentProviderService_.cancelPayment({
-        provider_id: session.provider_id,
+      await this.paymentProviderService_.cancelPayment(session.provider_id, {
         data,
       })
 
@@ -509,7 +519,7 @@ export default class PaymentModuleService
   @InjectTransactionManager()
   async authorizePaymentSession_(
     session: InferEntityType<typeof PaymentSession>,
-    data: Record<string, unknown>,
+    data: Record<string, unknown> | undefined,
     status: PaymentSessionStatus,
     @MedusaContext() sharedContext?: Context
   ): Promise<InferEntityType<typeof Payment>> {
@@ -711,10 +721,12 @@ export default class PaymentModuleService
     isFullyCaptured: boolean,
     @MedusaContext() sharedContext: Context = {}
   ) {
-    const paymentData = await this.paymentProviderService_.capturePayment({
-      data: payment.data!,
-      provider_id: payment.provider_id,
-    })
+    const paymentData = await this.paymentProviderService_.capturePayment(
+      payment.provider_id,
+      {
+        data: payment.data!,
+      }
+    )
 
     await this.paymentService_.update(
       {
@@ -817,11 +829,11 @@ export default class PaymentModuleService
     @MedusaContext() sharedContext: Context = {}
   ) {
     const paymentData = await this.paymentProviderService_.refundPayment(
+      payment.provider_id,
       {
         data: payment.data!,
-        provider_id: payment.provider_id,
-      },
-      refund.raw_amount as BigNumberInput
+        amount: refund.raw_amount as BigNumberInput,
+      }
     )
 
     await this.paymentService_.update(
@@ -843,9 +855,8 @@ export default class PaymentModuleService
       sharedContext
     )
 
-    await this.paymentProviderService_.cancelPayment({
+    await this.paymentProviderService_.cancelPayment(payment.provider_id, {
       data: payment.data!,
-      provider_id: payment.provider_id,
     })
 
     await this.paymentService_.update(
@@ -910,6 +921,78 @@ export default class PaymentModuleService
   }
 
   @InjectManager()
+  async createAccountHolder(
+    input: CreateAccountHolderDTO,
+    @MedusaContext() sharedContext?: Context
+  ): Promise<AccountHolderDTO> {
+    if (input.context?.accountHolder) {
+      return input.context.accountHolder as AccountHolderDTO
+    }
+
+    let accountHolder: InferEntityType<typeof AccountHolder> | undefined
+    let providerAccountHolder: Record<string, unknown> | undefined
+
+    try {
+      providerAccountHolder =
+        await this.paymentProviderService_.createAccountHolder(
+          input.provider_id,
+          { context: input.context }
+        )
+
+      // This can be empty when either the method is not supported or an account holder wasn't created
+      if (isPresent(providerAccountHolder)) {
+        accountHolder = await this.accountHolderService_.create(
+          {
+            external_id: providerAccountHolder.id,
+            email: input.context.customer?.email,
+            data: providerAccountHolder.data,
+            provider_id: input.provider_id,
+          },
+          sharedContext
+        )
+      }
+    } catch (error) {
+      if (providerAccountHolder) {
+        await this.paymentProviderService_.deleteAccountHolder(
+          input.provider_id,
+          {
+            context: { accountHolder: providerAccountHolder },
+          }
+        )
+      }
+
+      if (accountHolder) {
+        await this.accountHolderService_.delete(accountHolder.id, sharedContext)
+      }
+
+      throw error
+    }
+
+    return await this.baseRepository_.serialize(accountHolder)
+  }
+
+  @InjectManager()
+  async deleteAccountHolder(
+    id: string,
+    @MedusaContext() sharedContext?: Context
+  ): Promise<void> {
+    const accountHolder = await this.accountHolderService_.retrieve(
+      id,
+      { select: ["id", "provider_id", "external_id", "email", "data"] },
+      sharedContext
+    )
+
+    await this.accountHolderService_.delete(id, sharedContext)
+
+    await this.paymentProviderService_.deleteAccountHolder(
+      accountHolder.provider_id,
+      {
+        context: { accountHolder },
+      }
+    )
+  }
+
+  @InjectManager()
   async listPaymentMethods(
     filters: FilterablePaymentMethodProps,
     config: FindConfig<PaymentMethodDTO> = {},
@@ -917,12 +1000,12 @@ export default class PaymentModuleService
   ): Promise<PaymentMethodDTO[]> {
     const res = await this.paymentProviderService_.listPaymentMethods(
       filters.provider_id,
-      filters.context
+      { context: filters.context }
     )
 
     return res.map((item) => ({
       id: item.id,
-      data: item.data,
+      data: item.data!,
       provider_id: filters.provider_id,
     }))
   }
@@ -936,12 +1019,12 @@ export default class PaymentModuleService
     const paymentMethods =
       await this.paymentProviderService_.listPaymentMethods(
         filters.provider_id,
-        filters.context
+        { context: filters.context }
       )
 
     const normalizedResponse = paymentMethods.map((item) => ({
       id: item.id,
-      data: item.data,
+      data: item.data!,
       provider_id: filters.provider_id,
     }))
 
@@ -950,9 +1033,9 @@ export default class PaymentModuleService
 
   // @ts-ignore
   createPaymentMethods(
-    data: CreatePaymentCollectionDTO,
+    data: CreatePaymentMethodDTO,
     sharedContext?: Context
-  ): Promise<PaymentCollectionDTO>
+  ): Promise<PaymentMethodDTO>
 
   createPaymentMethods(
     data: CreatePaymentMethodDTO[],
@@ -975,7 +1058,7 @@ export default class PaymentModuleService
     const normalizedResponse = result.map((item, i) => {
       return {
         id: item.id,
-        data: item.data,
+        data: item.data!,
         provider_id: input[i].provider_id,
       }
     })
